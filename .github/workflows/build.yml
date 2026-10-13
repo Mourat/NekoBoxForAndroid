@@ -56,7 +56,22 @@ jobs:
           path: ~/.gradle
           key: gradle-oss-${{ hashFiles('**/*.gradle.kts') }}
       - name: Restore keystore
-        run: echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > release.keystore
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+        run: |
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            echo "$KEYSTORE_BASE64" | base64 -d > release.keystore
+          else
+            # No signing secrets: sign with a throwaway key so the APK still
+            # installs. Each such build has a different signature, so updating
+            # needs a reinstall. Add the KEYSTORE_* / ALIAS_* secrets for a
+            # stable signature.
+            echo "::warning::No KEYSTORE_BASE64 secret, signing with a throwaway key"
+            keytool -genkeypair -keystore release.keystore -storetype PKCS12 \
+              -alias nekobox -keyalg RSA -keysize 2048 -validity 10000 \
+              -storepass android -keypass android -dname "CN=NekoBox CI"
+            echo "FALLBACK_KEY=1" >> "$GITHUB_ENV"
+          fi
       - name: Gradle Build
         env:
           BUILD_PLUGIN: none
@@ -65,7 +80,11 @@ jobs:
           echo "ndk.dir=${ANDROID_HOME}/ndk/25.0.8775105" >> local.properties
           export LOCAL_PROPERTIES="${{ secrets.LOCAL_PROPERTIES }}"
           ./run init action gradle
-          KEYSTORE_PASS="${{ secrets.KEYSTORE_PASS }}" ALIAS_NAME="${{ secrets.ALIAS_NAME }}" ALIAS_PASS="${{ secrets.ALIAS_PASS}}" ./gradlew app:assembleOssRelease
+          if [ -n "$FALLBACK_KEY" ]; then
+            KEYSTORE_PASS=android ALIAS_NAME=nekobox ALIAS_PASS=android ./gradlew app:assembleOssRelease
+          else
+            KEYSTORE_PASS="${{ secrets.KEYSTORE_PASS }}" ALIAS_NAME="${{ secrets.ALIAS_NAME }}" ALIAS_PASS="${{ secrets.ALIAS_PASS}}" ./gradlew app:assembleOssRelease
+          fi
           APK=$(find app/build/outputs/apk -name '*arm64-v8a*.apk')
           APK=$(dirname $APK)
           echo "APK=$APK" >> $GITHUB_ENV

@@ -1,0 +1,116 @@
+From 5ee6518cda33868b1e83fc160f6421d29f4d4fb5 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 13 Oct 2026 17:56:54 +0200
+Subject: [PATCH] reality: keep X25519MLKEM768 and report client version 26.9.9
+
+Xray-core 26.7.11+ REALITY servers default minClientVer to 26.3.27, and
+26.9.8+ also drop a ClientHello without an X25519MLKEM768 key share
+before X25519. The client stripped ML-KEM and reported 1.8.1, so both
+checks failed. Keep ML-KEM, fall back to the Chrome parrot when the
+chosen fingerprint has no ML-KEM share, and report 26.9.9.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01VpZrbNmwH1jqanrMrcXre9
+---
+ common/tls/reality_client.go | 54 ++++++++++++++++++++++--------------
+ 1 file changed, 33 insertions(+), 21 deletions(-)
+
+diff --git a/common/tls/reality_client.go b/common/tls/reality_client.go
+index d832877..3c03415 100644
+--- a/common/tls/reality_client.go
++++ b/common/tls/reality_client.go
+@@ -30,7 +30,6 @@ import (
+ 	"github.com/sagernet/sing-box/adapter"
+ 	C "github.com/sagernet/sing-box/constant"
+ 	"github.com/sagernet/sing-box/option"
+-	"github.com/sagernet/sing/common"
+ 	"github.com/sagernet/sing/common/debug"
+ 	E "github.com/sagernet/sing/common/exceptions"
+ 	"github.com/sagernet/sing/common/logger"
+@@ -124,28 +123,26 @@ func (e *RealityClientConfig) ClientHandshake(ctx context.Context, conn net.Conn
+ 	uConfig.InsecureSkipVerify = true
+ 	uConfig.SessionTicketsDisabled = true
+ 	uConfig.VerifyPeerCertificate = verifier.VerifyPeerCertificate
+-	uConn := utls.UClient(conn, uConfig, e.uClient.id)
+-	verifier.UConn = uConn
++	// Xray-core 26.9.8+ REALITY servers reject a ClientHello that does not
++	// carry an X25519MLKEM768 key share ahead of X25519, so ML-KEM must stay in.
++	// Fingerprints whose utls parrot has no ML-KEM share (Firefox, Safari, iOS,
++	// Edge, ...) are swapped for Chrome, which sends GREASE, X25519MLKEM768,
++	// X25519 like current browsers.
++	fingerprint := e.uClient.id
++	uConn := utls.UClient(conn, uConfig, fingerprint)
+ 	err := uConn.BuildHandshakeState()
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-	for _, extension := range uConn.Extensions {
+-		if ce, ok := extension.(*utls.SupportedCurvesExtension); ok {
+-			ce.Curves = common.Filter(ce.Curves, func(curveID utls.CurveID) bool {
+-				return curveID != utls.X25519MLKEM768
+-			})
+-		}
+-		if ks, ok := extension.(*utls.KeyShareExtension); ok {
+-			ks.KeyShares = common.Filter(ks.KeyShares, func(share utls.KeyShare) bool {
+-				return share.Group != utls.X25519MLKEM768
+-			})
++	if !realityHasMLKEMKeyShare(uConn) {
++		fingerprint = utls.HelloChrome_Auto
++		uConn = utls.UClient(conn, uConfig, fingerprint)
++		err = uConn.BuildHandshakeState()
++		if err != nil {
++			return nil, err
+ 		}
+ 	}
+-	err = uConn.BuildHandshakeState()
+-	if err != nil {
+-		return nil, err
+-	}
++	verifier.UConn = uConn
+ 
+ 	if len(uConfig.NextProtos) > 0 {
+ 		for _, extension := range uConn.Extensions {
+@@ -168,9 +165,11 @@ func (e *RealityClientConfig) ClientHandshake(ctx context.Context, conn net.Conn
+ 	}
+ 	binary.BigEndian.PutUint64(hello.SessionId, uint64(nowTime.Unix()))
+ 
+-	hello.SessionId[0] = 1
+-	hello.SessionId[1] = 8
+-	hello.SessionId[2] = 1
++	// Client version as read by REALITY servers. Xray-core 26.7.11+ rejects
++	// anything below 26.3.27 unless minClientVer is lowered on the server.
++	hello.SessionId[0] = 26
++	hello.SessionId[1] = 9
++	hello.SessionId[2] = 9
+ 	binary.BigEndian.PutUint32(hello.SessionId[4:], uint32(time.Now().Unix()))
+ 	copy(hello.SessionId[8:], e.shortID[:])
+ 	if debug.Enabled {
+@@ -219,7 +218,7 @@ func (e *RealityClientConfig) ClientHandshake(ctx context.Context, conn net.Conn
+ 	}
+ 
+ 	if !verifier.verified {
+-		go realityClientFallback(e.ctx, uConn, e.uClient.ServerName(), e.uClient.id)
++		go realityClientFallback(e.ctx, uConn, e.uClient.ServerName(), fingerprint)
+ 		return nil, E.New("reality verification failed")
+ 	}
+ 
+@@ -330,3 +329,16 @@ func (c *realityClientConnWrapper) ReaderReplaceable() bool {
+ func (c *realityClientConnWrapper) WriterReplaceable() bool {
+ 	return true
+ }
++
++func realityHasMLKEMKeyShare(uConn *utls.UConn) bool {
++	for _, extension := range uConn.Extensions {
++		if ks, ok := extension.(*utls.KeyShareExtension); ok {
++			for _, share := range ks.KeyShares {
++				if share.Group == utls.X25519MLKEM768 {
++					return true
++				}
++			}
++		}
++	}
++	return false
++}
+-- 
+2.43.0
+
